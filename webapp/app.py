@@ -10,7 +10,6 @@ from flask import Flask, Response, jsonify, render_template, request
 
 import config
 from camera_stream import ESP32CamStream, build_stream_url
-from detector import SignalDetector, draw_label
 
 # Audio is optional: cloud servers may not have PortAudio installed.
 try:
@@ -29,6 +28,7 @@ except (ImportError, OSError) as exc:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Check that model files exist, without loading the AI model yet.
 if not os.path.exists(config.MODEL_PATH) or not os.path.exists(config.CLASSES_PATH):
     raise SystemExit(
         f"Classifier files not found at {config.MODEL_PATH} / {config.CLASSES_PATH}\n"
@@ -38,12 +38,36 @@ if not os.path.exists(config.MODEL_PATH) or not os.path.exists(config.CLASSES_PA
 app = Flask(__name__)
 
 cam_stream = ESP32CamStream(config.ESP32_STREAM_URL)
-detector = SignalDetector(
-    config.MODEL_PATH,
-    config.CLASSES_PATH,
-    config.CONF_THRESHOLD,
-    config.STABLE_FRAMES,
-)
+
+# Load the AI detector only when the user starts the system.
+detector = None
+draw_label = None
+detector_lock = threading.Lock()
+
+
+def load_detector():
+    global detector, draw_label
+
+    with detector_lock:
+        if detector is None:
+            logger.info("Loading AI detector...")
+
+            from detector import SignalDetector, draw_label as label_func
+
+            new_detector = SignalDetector(
+                config.MODEL_PATH,
+                config.CLASSES_PATH,
+                config.CONF_THRESHOLD,
+                config.STABLE_FRAMES,
+            )
+
+            detector = new_detector
+            draw_label = label_func
+
+            logger.info("AI detector loaded successfully.")
+
+    return detector
+
 
 # Do not initialize audio on servers where it is unavailable.
 tts = None
@@ -52,6 +76,7 @@ if AUDIO_AVAILABLE:
         tts = TTSWorker()
     except Exception as exc:
         logger.warning("Could not initialize text-to-speech: %s", exc)
+
 
 state_lock = threading.Lock()
 state = {
@@ -70,40 +95,51 @@ stop_event = threading.Event()
 
 def detection_loop():
     while not stop_event.is_set():
-        frame = cam_stream.get_frame()
+        try:
+            frame = cam_stream.get_frame()
 
-        if frame is None:
-            time.sleep(0.05)
-            continue
+            if frame is None:
+                time.sleep(0.05)
+                continue
 
-        stable_class = detector.process(frame)
+            active_detector = detector
+            if active_detector is None:
+                time.sleep(0.05)
+                continue
 
-        with state_lock:
-            state["current_class"] = stable_class
-            state["connected"] = cam_stream.connected
-
-        if stable_class in config.CLASS_PHRASES:
-            now = time.time()
+            stable_class = active_detector.process(frame)
 
             with state_lock:
-                changed = stable_class != state["last_spoken_class"]
-                stale = (
-                    now - state["last_spoken_time"]
-                ) >= config.REPEAT_INTERVAL_SEC
+                state["current_class"] = stable_class
+                state["connected"] = cam_stream.connected
 
-            if (changed or stale) and tts is not None:
-                phrase = config.CLASS_PHRASES[stable_class]
+            if stable_class in config.CLASS_PHRASES:
+                now = time.time()
 
-                try:
-                    tts.speak(phrase)
-                    with state_lock:
-                        state["last_spoken_class"] = stable_class
-                        state["last_spoken_text"] = phrase
-                        state["last_spoken_time"] = now
-                except Exception:
-                    logger.exception("Voice output failed")
+                with state_lock:
+                    changed = stable_class != state["last_spoken_class"]
+                    stale = (
+                        now - state["last_spoken_time"]
+                    ) >= config.REPEAT_INTERVAL_SEC
 
-        time.sleep(0.01)
+                if (changed or stale) and tts is not None:
+                    phrase = config.CLASS_PHRASES[stable_class]
+
+                    try:
+                        tts.speak(phrase)
+
+                        with state_lock:
+                            state["last_spoken_class"] = stable_class
+                            state["last_spoken_text"] = phrase
+                            state["last_spoken_time"] = now
+                    except Exception:
+                        logger.exception("Voice output failed")
+
+            time.sleep(0.01)
+
+        except Exception:
+            logger.exception("Error in detection loop")
+            time.sleep(0.5)
 
 
 @app.route("/")
@@ -112,6 +148,7 @@ def index():
         urlparse(config.ESP32_STREAM_URL).netloc
         or config.ESP32_STREAM_URL
     )
+
     return render_template(
         "index.html",
         default_esp32_host=default_host,
@@ -162,6 +199,21 @@ def start_system():
                 "message": "Already running",
             })
 
+    # Load the model only when detection is requested.
+    try:
+        active_detector = load_detector()
+    except Exception:
+        logger.exception("Could not load signal detector")
+
+        return jsonify({
+            "ok": False,
+            "error": (
+                "Could not load AI model. "
+                "The server may not have enough memory."
+            ),
+        }), 503
+
+    with state_lock:
         state["running"] = True
         state["stream_url"] = stream_url
         state["current_class"] = None
@@ -169,22 +221,39 @@ def start_system():
         state["last_spoken_text"] = None
         state["last_spoken_time"] = 0.0
 
-    if tts is not None:
-        try:
-            tts.set_device(device_index)
-        except Exception:
-            logger.exception("Could not select audio device")
+    try:
+        if tts is not None:
+            try:
+                tts.set_device(device_index)
+            except Exception:
+                logger.exception("Could not select audio device")
 
-    detector.reset()
-    cam_stream.set_url(stream_url)
-    cam_stream.start()
+        active_detector.reset()
+        cam_stream.set_url(stream_url)
+        stop_event.clear()
+        cam_stream.start()
 
-    stop_event.clear()
-    worker_thread = threading.Thread(
-        target=detection_loop,
-        daemon=True,
-    )
-    worker_thread.start()
+        worker_thread = threading.Thread(
+            target=detection_loop,
+            daemon=True,
+        )
+        worker_thread.start()
+
+    except Exception:
+        logger.exception("Could not start detection system")
+
+        stop_event.set()
+        cam_stream.stop()
+
+        with state_lock:
+            state["running"] = False
+            state["connected"] = False
+            state["stream_url"] = None
+
+        return jsonify({
+            "ok": False,
+            "error": "Could not start the detection system.",
+        }), 500
 
     return jsonify({
         "ok": True,
@@ -225,7 +294,14 @@ def mjpeg_generator():
             time.sleep(0.05)
             continue
 
-        annotated = draw_label(frame, detector.last_prediction)
+        active_detector = detector
+        label_func = draw_label
+
+        if active_detector is None or label_func is None:
+            time.sleep(0.1)
+            continue
+
+        annotated = label_func(frame, active_detector.last_prediction)
 
         ok, buf = cv2.imencode(
             ".jpg",
@@ -256,6 +332,7 @@ def video_feed():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+
     app.run(
         host="0.0.0.0",
         port=port,
